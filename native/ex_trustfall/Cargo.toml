@@ -1,0 +1,15 @@
+[package]
+name = "ex_trustfall"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+name = "ex_trustfall"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.29.1"
+rustler_elixir_fun = { path = "/home/erika/projects/rust/elixir-rustler_elixir_fun/native/rustler_elixir_fun_nif/rustler_elixir_fun/" }
+trustfall_core = "0.5.1"
