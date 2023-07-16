@@ -1,8 +1,10 @@
+use rustler::env::SavedTerm;
 use rustler::*;
 use rustler_elixir_fun;
 use rustler_stored_term::StoredTerm;
 use std::any::type_name;
 use std::fmt::Debug;
+use std::time::Duration;
 use std::{collections::BTreeMap, sync::Arc};
 use trustfall_core::{
     frontend::parse,
@@ -55,22 +57,23 @@ impl ContextIterator {
     }
 }
 
-struct AdapterConfig<'a> {
-    elixir_invoker: Term<'a>,
-    resolve_starting_vertices: Term<'a>,
-    resolve_property: Term<'a>,
-    resolve_neighbors: Term<'a>,
-    resolve_coercion: Term<'a>,
-    env: Env<'a>,
+struct AdapterConfig {
+    elixir_invoker: SavedTerm,
+    resolve_starting_vertices: SavedTerm,
+    resolve_property: SavedTerm,
+    resolve_neighbors: SavedTerm,
+    resolve_coercion: SavedTerm,
+    env: OwnedEnv,
 }
 
-impl<'a> AdapterConfig<'a> {
-    pub fn new<'b>(adapter_shim: AdapterShim<'a>, env: Env<'a>) -> Result<Self, ()> {
-        let elixir_invoker = adapter_shim.elixir_invoker;
-        let resolve_starting_vertices = adapter_shim.resolve_starting_vertices;
-        let resolve_property = adapter_shim.resolve_property;
-        let resolve_neighbors = adapter_shim.resolve_neighbors;
-        let resolve_coercion = adapter_shim.resolve_coercion;
+impl AdapterConfig {
+    pub fn new<'a>(adapter_shim: AdapterShim<'a>, owned_env: OwnedEnv) -> Result<Self, ()> {
+        let elixir_invoker = owned_env.save(adapter_shim.elixir_invoker);
+        let resolve_starting_vertices = owned_env.save(adapter_shim.resolve_starting_vertices);
+        let resolve_property = owned_env.save(adapter_shim.resolve_property);
+        let resolve_neighbors = owned_env.save(adapter_shim.resolve_neighbors);
+        let resolve_coercion = owned_env.save(adapter_shim.resolve_coercion);
+        let env = owned_env;
 
         Ok(Self {
             elixir_invoker,
@@ -101,7 +104,26 @@ fn make_elixir_value<'a>(env: Env<'a>, value: FieldValue) -> Term<'a> {
     }
 }
 
-impl Adapter<'static> for AdapterConfig<'static> {
+fn make_stored_term(value: FieldValue) -> StoredTerm {
+    match value {
+        FieldValue::Null => StoredTerm::AnAtom(rustler::types::atom::nil()),
+        FieldValue::Uint64(x) => StoredTerm::Integer(x.try_into().unwrap()),
+        FieldValue::Int64(x) => StoredTerm::Integer(x),
+        FieldValue::Float64(x) => StoredTerm::Float(x),
+        FieldValue::String(x) => StoredTerm::Bitstring(x),
+        FieldValue::Boolean(true) => StoredTerm::AnAtom(rustler::types::atom::true_()),
+        FieldValue::Boolean(false) => StoredTerm::AnAtom(rustler::types::atom::false_()),
+        FieldValue::DateTimeUtc(_) => todo!(),
+        FieldValue::Enum(_) => todo!(),
+        FieldValue::List(x) => StoredTerm::List(
+            x.into_iter()
+                .map(|v| make_stored_term(v))
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+impl Adapter<'static> for AdapterConfig {
     type Vertex = Arc<StoredTerm>;
 
     fn resolve_starting_vertices(
@@ -110,23 +132,36 @@ impl Adapter<'static> for AdapterConfig<'static> {
         parameters: &EdgeParameters,
         _resolve_info: &ResolveInfo,
     ) -> VertexIterator<'static, Self::Vertex> {
-        let parameter_data: Vec<(String, Term)> = parameters
-            .iter()
-            .map(|(k, v)| (k.to_string(), make_elixir_value(self.env, v.to_owned())))
-            .collect();
+        dbg!("hello6");
+
+        let parameter_data: Vec<(String, StoredTerm)> = {
+            parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), make_stored_term(v.to_owned())))
+                .collect()
+        };
+        dbg!("hello7");
 
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) =
-            rustler_elixir_fun::apply_elixir_fun(
-                self.env,
-                self.elixir_invoker,
-                self.resolve_starting_vertices,
-                (
-                    edge_name.as_ref(),
-                    rustler::Term::map_from_pairs(self.env, &parameter_data).unwrap(),
-                )
-                    .encode(self.env),
-            )
-            .unwrap() else { todo!() };
+            self.env.run(|env| {
+dbg!("before");
+dbg!(env.as_c_arg());
+let result = rustler_elixir_fun::apply_elixir_fun_timeout(
+                env,
+                self.elixir_invoker.load(env),
+                self.resolve_starting_vertices.load(env),
+                vec![
+                    edge_name.as_ref().encode(env),
+                    rustler::Term::map_from_pairs(env, &parameter_data.iter().map(|(k, v)| (k, v.encode(env))).collect::<Vec<_>>()).unwrap().encode(env),
+                ]
+                    .encode(env), Duration::from_millis(500000)
+            );
+dbg!("here");
+            result.unwrap() }) else {
+dbg!("blow up"); 
+todo!()
+};
+        dbg!("hello8");
 
         let StoredTerm::List(val) = inner else { todo!() };
 
@@ -140,15 +175,16 @@ impl Adapter<'static> for AdapterConfig<'static> {
         property_name: &Arc<str>,
         _resolve_info: &ResolveInfo,
     ) -> ContextOutcomeIterator<'static, Self::Vertex, FieldValue> {
-        let contexts = encode_contexts(ContextIterator::new(contexts), self.env);
+        let contexts = ContextIterator::new(contexts);
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) =
-            rustler_elixir_fun::apply_elixir_fun(
-                self.env,
-                self.elixir_invoker,
-                self.resolve_property,
-                (contexts, type_name.as_ref(), property_name.as_ref()).encode(self.env),
+            self.env.run(|env| rustler_elixir_fun::apply_elixir_fun(
+                env,
+                self.elixir_invoker.load(env),
+                self.resolve_property.load(env),
+                vec![
+contexts.0.map(|v| v.active_vertex().encode(env)).collect::<Vec<Term>>().encode(env), type_name.as_ref().encode(env), property_name.as_ref().encode(env)].encode(env),
             )
-            .unwrap() else { todo!() };
+            .unwrap()) else { todo!() };
 
         let StoredTerm::List(val) = inner else { todo!() };
 
@@ -163,26 +199,28 @@ impl Adapter<'static> for AdapterConfig<'static> {
         parameters: &EdgeParameters,
         _resolve_info: &ResolveEdgeInfo,
     ) -> ContextOutcomeIterator<'static, Self::Vertex, VertexIterator<'static, Self::Vertex>> {
-        let contexts = encode_contexts(ContextIterator::new(contexts), self.env);
-        let parameter_data: Vec<(String, Term)> = parameters
-            .iter()
-            .map(|(k, v)| (k.to_string(), make_elixir_value(self.env, v.to_owned())))
-            .collect();
+        let contexts = ContextIterator::new(contexts);
+        let parameter_data: Vec<(String, StoredTerm)> = {
+            parameters
+                .iter()
+                .map(|(k, v)| (k.to_string(), make_stored_term(v.to_owned())))
+                .collect()
+        };
 
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) =
-            rustler_elixir_fun::apply_elixir_fun(
-                self.env,
-                self.elixir_invoker,
-                self.resolve_neighbors,
-                (
-                    contexts,
-                    type_name.as_ref(),
-                    edge_name.as_ref(),
-                    rustler::Term::map_from_pairs(self.env, &parameter_data).unwrap(),
-                )
-                    .encode(self.env),
+            self.env.run(|env| rustler_elixir_fun::apply_elixir_fun(
+                env,
+                self.elixir_invoker.load(env),
+                self.resolve_neighbors.load(env),
+                vec![
+                    contexts.0.map(|v| v.active_vertex().encode(env)).collect::<Vec<Term>>().encode(env),
+                    type_name.as_ref().encode(env),
+                    edge_name.as_ref().encode(env),
+                    rustler::Term::map_from_pairs(env, &parameter_data.iter().map(|(k, v)| (k, v.encode(env))).collect::<Vec<_>>()).unwrap().encode(env),
+                ]
+                    .encode(env),
             )
-            .unwrap() else { todo!() };
+            .unwrap()) else { todo!() };
 
         let StoredTerm::List(val) = inner else { todo!() };
 
@@ -196,15 +234,15 @@ impl Adapter<'static> for AdapterConfig<'static> {
         coerce_to_type: &Arc<str>,
         _resolve_info: &ResolveInfo,
     ) -> ContextOutcomeIterator<'static, Self::Vertex, bool> {
-        let contexts = encode_contexts(ContextIterator::new(contexts), self.env);
+        let contexts = ContextIterator::new(contexts);
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) =
-            rustler_elixir_fun::apply_elixir_fun(
-                self.env,
-                self.elixir_invoker,
-                self.resolve_coercion,
-                (contexts, type_name.as_ref(), coerce_to_type.as_ref()).encode(self.env),
+            self.env.run(|env| rustler_elixir_fun::apply_elixir_fun(
+                env,
+                self.elixir_invoker.load(env),
+                self.resolve_coercion.load(env),
+                vec![contexts.0.map(|v| v.active_vertex().encode(env)).collect::<Vec<Term>>().encode(env), type_name.as_ref().encode(env), coerce_to_type.as_ref().encode(env)].encode(env),
             )
-            .unwrap() else { todo!() };
+            .unwrap()) else { todo!() };
 
         let StoredTerm::List(val) = inner else { todo!() };
 
@@ -212,13 +250,13 @@ impl Adapter<'static> for AdapterConfig<'static> {
     }
 }
 
-fn encode_contexts<'a>(context_iterator: ContextIterator, env: Env<'a>) -> Vec<Term<'a>> {
-    let encoded: Vec<Term> = context_iterator
-        .0
-        .map(|v| v.active_vertex().encode(env))
-        .collect();
-    encoded
-}
+// fn encode_contexts(context_iterator: ContextIterator, env: OwnedEnv) -> Vec<SavedTerm> {
+//     let encoded: Vec<SavedTerm> = context_iterator
+//         .0
+//         .map(|v| env.save(env.run(|sub_env| v.active_vertex().encode(sub_env))))
+//         .collect();
+//     encoded
+// }
 
 fn context_from_stored_term(term: StoredTerm) -> Context {
     Context(DataContext::new(Some(Arc::new(term))))
@@ -354,9 +392,15 @@ fn apply_elixir_fun<'a>(
     env: Env<'a>,
     pid_or_name: Term<'a>,
     fun: Term<'a>,
-    parameters: Term<'a>,
+    _parameters: Term<'a>,
 ) -> Result<Term<'a>, Error> {
-    Ok(rustler_elixir_fun::apply_elixir_fun(env, pid_or_name, fun, parameters)?.encode(env))
+    Ok(rustler_elixir_fun::apply_elixir_fun(
+        env,
+        pid_or_name,
+        fun,
+        vec!["hello".encode(env), 1.encode(env)].encode(env),
+    )?
+    .encode(env))
 }
 
 fn type_of<T>(_: T) -> &'static str {
@@ -513,16 +557,38 @@ fn interpret_query<'a>(
     // {
     //     dbg!(make_field_value_from_stored_term(&inner));
     // }
-    let adapter_config = AdapterConfig::new(adapter, env).unwrap();
+dbg!(env.as_c_arg());
+    dbg!("hello");
+    let owned_env = rustler::OwnedEnv::new();
+
+    let adapter_config = AdapterConfig::new(adapter, owned_env).unwrap();
+    dbg!("hello2");
     let wrapped_adapter = Arc::from(adapter_config);
+    dbg!("hello3");
 
     let indexed_query = parse(&my_schema, query).unwrap();
+    dbg!("hello4");
     let execution = interpret_ir(
         wrapped_adapter,
         indexed_query,
         to_query_arguments(arguments).unwrap(),
     )
     .unwrap();
+    dbg!("dead");
+    let owned_iter: Box<dyn Iterator<Item = BTreeMap<String, Term>>> =
+        Box::new(execution.map(|res| {
+            res.into_iter()
+                .map(|(k, v)| {
+                    let elixir_value = make_elixir_value(env, v);
+                    (k.to_string(), elixir_value)
+                })
+                .collect()
+        }));
+    for item in owned_iter {
+        dbg!(item);
+    }
+
+    //Ok(ResultIterator { iter: owned_iter });
     dbg!(query);
     print!("\r");
     print!("{}\n\r", query);
