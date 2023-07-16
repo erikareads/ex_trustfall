@@ -168,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "rustler",
  "rustler_elixir_fun",
+ "rustler_stored_term",
  "trustfall_core",
 ]
 

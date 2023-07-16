@@ -12,4 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 rustler = "0.29.1"
 rustler_elixir_fun = { path = "/home/erika/projects/rust/elixir-rustler_elixir_fun/native/rustler_elixir_fun_nif/rustler_elixir_fun/" }
+rustler_stored_term = { path = "/home/erika/projects/rust/elixir-rustler_elixir_fun/native/rustler_elixir_fun_nif/rustler_stored_term/" }
 trustfall_core = "0.5.1"
