@@ -101,7 +101,7 @@ fn make_elixir_value<'a>(env: Env<'a>, value: FieldValue) -> Term<'a> {
     }
 }
 
-impl Adapter<'static> for AdapterConfig<'static> {
+impl<'a> Adapter<'a> for AdapterConfig<'a> {
     type Vertex = Arc<StoredTerm>;
 
     fn resolve_starting_vertices(
