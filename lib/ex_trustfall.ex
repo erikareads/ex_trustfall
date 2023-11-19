@@ -85,7 +85,7 @@ defmodule ExTrustfall.Example do
 
   @impl true
   def resolve_starting_vertices(edge_name, parameters) do
-    IO.inspect({edge_name, parameters})
+    IO.inspect({edge_name, parameters, "hello"})
     max_value = parameters["max"]
     0..max_value |> Enum.to_list()
   end
