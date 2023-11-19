@@ -13,4 +13,4 @@ crate-type = ["cdylib"]
 rustler = "0.29.1"
 rustler_elixir_fun = { path = "../rustler_elixir_fun_nif/rustler_elixir_fun/" }
 rustler_stored_term = { path = "../rustler_elixir_fun_nif/rustler_stored_term/" }
-trustfall_core = "0.5.1"
+trustfall_core = "0.7.1"

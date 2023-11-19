@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use trustfall_core::{
     frontend::parse,
     interpreter::{
-        execution::interpret_ir, Adapter, ContextIterator as BaseContextIterator,
+        execution::interpret_ir, Adapter, AsVertex, ContextIterator as BaseContextIterator,
         ContextOutcomeIterator, DataContext, ResolveEdgeInfo, ResolveInfo, VertexIterator,
     },
     ir::{EdgeParameters, FieldValue},
@@ -50,11 +50,47 @@ impl Context {
     }
 }
 
-pub struct ContextIterator(VertexIterator<'static, Context>);
+pub(crate) struct Opaque {
+    data: *mut (),
+    pub(crate) vertex: Option<Arc<StoredTerm>>,
+}
+
+impl Opaque {
+    fn new<V: AsVertex<Arc<StoredTerm>> + 'static>(ctx: DataContext<V>) -> Self {
+        let vertex = ctx.active_vertex::<Arc<StoredTerm>>().cloned();
+        let boxed = Box::new(ctx);
+        let data = Box::into_raw(boxed) as *mut ();
+
+        Self { data, vertex }
+    }
+
+    /// Converts an `Opaque` into the `DataContext<V>` it points to.
+    ///
+    /// # Safety
+    ///
+    /// When an `Opaque` is constructed, it does not store the value of the `V` generic parameter
+    /// it was constructed with. The caller of this function must ensure that the `V` parameter here
+    /// is the same type as the one used in the `Opaque::new()` call that constructed `self` here.
+    unsafe fn into_inner<V: AsVertex<Arc<StoredTerm>> + 'static>(self) -> DataContext<V> {
+        let boxed_ctx = unsafe { Box::from_raw(self.data as *mut DataContext<V>) };
+        *boxed_ctx
+    }
+}
+
+impl Opaque {
+    // fn active_vertex(&self) -> PyResult<Option<Py<PyAny>>> {
+    //     Ok(self.vertex.as_ref().map(|arc| (**arc).clone()))
+    // }
+    fn active_vertex(&self) -> Result<Option<StoredTerm>, ()> {
+        Ok(self.vertex.as_ref().map(|arc| (**arc).clone()))
+    }
+}
+
+pub struct ContextIterator(VertexIterator<'static, Opaque>);
 
 impl ContextIterator {
-    fn new(inner: VertexIterator<'static, DataContext<Arc<StoredTerm>>>) -> Self {
-        Self(Box::new(inner.map(Context)))
+    fn new<V: AsVertex<Arc<StoredTerm>> + 'static>(inner: BaseContextIterator<'static, V>) -> Self {
+        Self(Box::new(inner.map(Opaque::new)))
     }
 }
 
@@ -104,13 +140,13 @@ fn make_elixir_value<'a>(env: Env<'a>, value: FieldValue) -> Term<'a> {
         FieldValue::Float64(x) => x.encode(env),
         FieldValue::String(x) => x.encode(env),
         FieldValue::Boolean(x) => x.encode(env),
-        FieldValue::DateTimeUtc(_) => todo!(),
         FieldValue::Enum(_) => todo!(),
         FieldValue::List(x) => x
             .into_iter()
-            .map(|v| make_elixir_value(env, v))
+            .map(|v| make_elixir_value(env, v.clone()))
             .collect::<Vec<_>>()
             .encode(env),
+        _ => todo!(),
     }
 }
 
@@ -120,16 +156,16 @@ fn make_stored_term(value: FieldValue) -> StoredTerm {
         FieldValue::Uint64(x) => StoredTerm::Integer(x.try_into().unwrap()),
         FieldValue::Int64(x) => StoredTerm::Integer(x),
         FieldValue::Float64(x) => StoredTerm::Float(x),
-        FieldValue::String(x) => StoredTerm::Bitstring(x),
+        FieldValue::String(x) => StoredTerm::Bitstring(x.as_ref().to_string()),
         FieldValue::Boolean(true) => StoredTerm::AnAtom(rustler::types::atom::true_()),
         FieldValue::Boolean(false) => StoredTerm::AnAtom(rustler::types::atom::false_()),
-        FieldValue::DateTimeUtc(_) => todo!(),
         FieldValue::Enum(_) => todo!(),
         FieldValue::List(x) => StoredTerm::List(
             x.into_iter()
-                .map(|v| make_stored_term(v))
+                .map(|v| make_stored_term(v.clone()))
                 .collect::<Vec<_>>(),
         ),
+        _ => todo!(),
     }
 }
 
@@ -188,16 +224,18 @@ impl Adapter<'static> for AdapterConfig {
             todo!()
         };
 
-        Box::new(ElixirVertexIterator::new(val))
+        let vertex_iterator = ElixirVertexIterator::new(val);
+        dbg!(vertex_iterator.clone());
+        Box::new(vertex_iterator)
     }
 
-    fn resolve_property(
+    fn resolve_property<V: AsVertex<Self::Vertex> + 'static>(
         &self,
-        contexts: BaseContextIterator<'static, Self::Vertex>,
+        contexts: BaseContextIterator<'static, V>,
         type_name: &Arc<str>,
         property_name: &Arc<str>,
         _resolve_info: &ResolveInfo,
-    ) -> ContextOutcomeIterator<'static, Self::Vertex, FieldValue> {
+    ) -> ContextOutcomeIterator<'static, V, FieldValue> {
         let contexts = ContextIterator::new(contexts);
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) = self.env.run(|env| {
             rustler_elixir_fun::apply_elixir_fun_timeout_owned(
@@ -227,17 +265,26 @@ impl Adapter<'static> for AdapterConfig {
             todo!()
         };
 
-        Box::new(ElixirResolvePropertyIterator::new(val))
+        let iter = ElixirResolvePropertyIterator::new(val);
+
+        //Box::new(ElixirResolvePropertyIterator::new(val))
+        Box::new(iter.map(|(opaque, value)| {
+            // SAFETY: This `Opaque` was constructed just a few lines ago
+            //         in this `resolve_property()` call, so the `V` type must be the same.
+            let ctx = unsafe { opaque.into_inner() };
+
+            (ctx, value)
+        }))
     }
 
-    fn resolve_neighbors(
+    fn resolve_neighbors<V: AsVertex<Self::Vertex> + 'static>(
         &self,
-        contexts: BaseContextIterator<'static, Self::Vertex>,
+        contexts: BaseContextIterator<'static, V>,
         type_name: &Arc<str>,
         edge_name: &Arc<str>,
         parameters: &EdgeParameters,
         _resolve_info: &ResolveEdgeInfo,
-    ) -> ContextOutcomeIterator<'static, Self::Vertex, VertexIterator<'static, Self::Vertex>> {
+    ) -> ContextOutcomeIterator<'static, V, VertexIterator<'static, Self::Vertex>> {
         let contexts = ContextIterator::new(contexts);
         let parameter_data: Vec<(String, StoredTerm)> = {
             parameters
@@ -282,17 +329,23 @@ impl Adapter<'static> for AdapterConfig {
         let StoredTerm::List(val) = inner else {
             todo!()
         };
+        let iter = ElixirResolveNeighborsIterator::new(val);
+        Box::new(iter.map(|(opaque, neighbors)| {
+            // SAFETY: This `Opaque` was constructed just a few lines ago
+            //         in this `resolve_neighbors()` call, so the `V` type must be the same.
+            let ctx = unsafe { opaque.into_inner() };
 
-        Box::new(ElixirResolveNeighborsIterator::new(val))
+            (ctx, neighbors)
+        }))
     }
 
-    fn resolve_coercion(
+    fn resolve_coercion<V: AsVertex<Self::Vertex> + 'static>(
         &self,
-        contexts: BaseContextIterator<'static, Self::Vertex>,
+        contexts: BaseContextIterator<'static, V>,
         type_name: &Arc<str>,
         coerce_to_type: &Arc<str>,
         _resolve_info: &ResolveInfo,
-    ) -> ContextOutcomeIterator<'static, Self::Vertex, bool> {
+    ) -> ContextOutcomeIterator<'static, V, bool> {
         let contexts = ContextIterator::new(contexts);
         let rustler_elixir_fun::ElixirFunCallResult::Success(inner) = self.env.run(|env| {
             rustler_elixir_fun::apply_elixir_fun_timeout_owned(
@@ -322,7 +375,14 @@ impl Adapter<'static> for AdapterConfig {
             todo!()
         };
 
-        Box::new(ElixirResolveCoercionIterator::new(val))
+        let iter = ElixirResolveCoercionIterator::new(val);
+        Box::new(iter.map(|(opaque, value)| {
+            // SAFETY: This `Opaque` was constructed just a few lines ago
+            //         in this `resolve_coercion()` call, so the `V` type must be the same.
+            let ctx = unsafe { opaque.into_inner() };
+
+            (ctx, value)
+        }))
     }
 }
 
@@ -334,8 +394,9 @@ impl Adapter<'static> for AdapterConfig {
 //     encoded
 // }
 
-fn context_from_stored_term(term: StoredTerm) -> Context {
-    Context(DataContext::new(Some(Arc::new(term))))
+fn context_from_stored_term(term: StoredTerm) -> Opaque {
+    //Context(DataContext::new(Some(Arc::new(term))))
+    Opaque::new(DataContext::new(Some(Arc::new(term))))
 }
 
 fn stored_term_to_boolean(atom: &Atom) -> bool {
@@ -346,6 +407,7 @@ fn stored_term_to_boolean(atom: &Atom) -> bool {
     }
 }
 
+#[derive(Debug, Clone)]
 struct ElixirVertexIterator {
     underlying: Vec<StoredTerm>,
 }
@@ -378,7 +440,7 @@ impl ElixirResolvePropertyIterator {
 }
 
 impl Iterator for ElixirResolvePropertyIterator {
-    type Item = (DataContext<Arc<StoredTerm>>, FieldValue);
+    type Item = (Opaque, FieldValue);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying.iter().next() {
@@ -387,11 +449,11 @@ impl Iterator for ElixirResolvePropertyIterator {
                     todo!()
                 };
 
-                let context: Context =
+                let context: Opaque =
                     context_from_stored_term(output_tuple.iter().next().unwrap().clone());
                 let value: FieldValue =
                     make_field_value_from_stored_term(output_tuple.iter().next().unwrap()).unwrap();
-                Some((context.0, value))
+                Some((context, value))
             }
             None => None,
         }
@@ -409,10 +471,7 @@ impl ElixirResolveNeighborsIterator {
 }
 
 impl Iterator for ElixirResolveNeighborsIterator {
-    type Item = (
-        DataContext<Arc<StoredTerm>>,
-        VertexIterator<'static, Arc<StoredTerm>>,
-    );
+    type Item = (Opaque, VertexIterator<'static, Arc<StoredTerm>>);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying.iter().next() {
@@ -421,8 +480,7 @@ impl Iterator for ElixirResolveNeighborsIterator {
                     todo!()
                 };
 
-                let context: Context =
-                    context_from_stored_term(output_tuple.iter().next().unwrap().clone());
+                let context = context_from_stored_term(output_tuple.iter().next().unwrap().clone());
                 let StoredTerm::List(neighbors_iterable) =
                     output_tuple.iter().next().unwrap().clone()
                 else {
@@ -431,7 +489,7 @@ impl Iterator for ElixirResolveNeighborsIterator {
 
                 let neighbors: VertexIterator<'static, Arc<StoredTerm>> =
                     Box::new(ElixirVertexIterator::new(neighbors_iterable));
-                Some((context.0, neighbors))
+                Some((context, neighbors))
             }
             None => None,
         }
@@ -449,7 +507,7 @@ impl ElixirResolveCoercionIterator {
 }
 
 impl Iterator for ElixirResolveCoercionIterator {
-    type Item = (DataContext<Arc<StoredTerm>>, bool);
+    type Item = (Opaque, bool);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.underlying.iter().next() {
@@ -458,13 +516,13 @@ impl Iterator for ElixirResolveCoercionIterator {
                     todo!()
                 };
 
-                let context: Context =
+                let context: Opaque =
                     context_from_stored_term(output_tuple.iter().next().unwrap().clone());
                 let StoredTerm::AnAtom(can_coerce) = output_tuple.iter().next().unwrap() else {
                     todo!()
                 };
 
-                Some((context.0, stored_term_to_boolean(can_coerce)))
+                Some((context, stored_term_to_boolean(can_coerce)))
             }
             None => None,
         }
@@ -522,8 +580,10 @@ fn make_field_value_from_term(value: &Term) -> Result<FieldValue, ()> {
                 Err(())
             }
         }
-        rustler::TermType::Binary => Ok(FieldValue::String(value.decode::<String>().unwrap())),
-        rustler::TermType::EmptyList => Ok(FieldValue::List(Vec::new())),
+        rustler::TermType::Binary => {
+            Ok(FieldValue::String(value.decode::<String>().unwrap().into()))
+        }
+        rustler::TermType::EmptyList => Ok(FieldValue::List(Vec::new().into())),
         rustler::TermType::List => {
             if let Ok(inner) = value.decode::<Vec<Term>>() {
                 let converted_values = inner.iter().map(make_field_value_from_term).try_fold(
@@ -538,7 +598,7 @@ fn make_field_value_from_term(value: &Term) -> Result<FieldValue, ()> {
                     },
                 );
                 if let Some(inner_values) = converted_values {
-                    Ok(FieldValue::List(inner_values))
+                    Ok(FieldValue::List(inner_values.into()))
                 } else {
                     Err(())
                 }
@@ -573,8 +633,8 @@ fn make_field_value_from_stored_term(value: &StoredTerm) -> Result<FieldValue, (
         }
         StoredTerm::Integer(val) => Ok(FieldValue::Int64(*val)),
         StoredTerm::Float(val) => Ok(FieldValue::Float64(*val)),
-        StoredTerm::Bitstring(val) => Ok(FieldValue::String(val.to_string())),
-        StoredTerm::EmptyList() => Ok(FieldValue::List(Vec::new())),
+        StoredTerm::Bitstring(val) => Ok(FieldValue::String(val.to_string().into())),
+        StoredTerm::EmptyList() => Ok(FieldValue::List(Vec::new().into())),
 
         StoredTerm::List(val) => {
             let converted_values = val.iter().map(&make_field_value_from_stored_term).try_fold(
@@ -589,7 +649,7 @@ fn make_field_value_from_stored_term(value: &StoredTerm) -> Result<FieldValue, (
                 },
             );
             if let Some(inner_values) = converted_values {
-                Ok(FieldValue::List(inner_values))
+                Ok(FieldValue::List(inner_values.into()))
             } else {
                 Err(())
             }
